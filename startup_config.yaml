@@ -1,0 +1,12 @@
+CAMERA_TYPE: MVIMPACT_NIR
+CONNECTION_TYPE: SIMULATED
+FPS: 30
+MODEL_PATH: C:/Users/GKoinig/Desktop/SenSoRTC-development/SenSoRTC-development/yolov8n.pt
+MODEL_VERBOSE: true
+MVIMPACT_NIR_SETTINGS_PATH: mvimpact_nir_camera_settings.yaml
+NIR_CLASSIFIER_KIND: SAM_PLACEHOLDER
+NIR_CLASSIFIER_PATH: ''
+PFS_PATH: C:/Users/Technikum-Admin/Desktop/Gerald/AI_SENSE_CLASSIFIER-DWRL_MAIN_CONTROL_SOFTWARE_MODBUS_28.04.26/Camera_Settings/Kamerasettings_DWRL_oben_standard.pfs
+SCALEABLE_UI: false
+USB_CAMERA_SETTINGS_PATH: sensor_tc_camera_settings.yaml
+VIDEO_PATH: C:/Users/GKoinig/Desktop/SenSoRTC-development/SenSoRTC-development/Camera_Settings/X_TESTING/simulated_camera_video/output_pizza.mp4
