@@ -450,7 +450,8 @@ def display(
     VERT_MOVEMENT, CALIBRATED_VERT_MOVEMENT, RUN_VERT_CALIBRATION,
     ROTATE, FLIP_H, FLIP_V,
     RAW_RECORDING_FPS,GUI_RECORDING_FPS,RECORDING_PATHS,
-    FPS=None, SCALEABLE=False, NIR_MODE=False, NIR_CLASSIFIER_KIND="", NIR_CLASS_COLORS=None
+    FPS=None, SCALEABLE=False, NIR_MODE=False, NIR_CLASSIFIER_KIND="", NIR_CLASS_COLORS=None,
+    MODEL_INFO=None, MODEL_SWAP_QUEUE=None, N_CLASSES=None
 ):
     global recording
     try:
@@ -468,6 +469,7 @@ def display(
         clock = pygame.time.Clock()
         font_title = pygame.font.SysFont("Segoe UI", 28, bold=True)
         font_small = pygame.font.SysFont("Segoe UI", 16)
+        font_small_bold = pygame.font.SysFont("Segoe UI", 15, bold=True)
     except Exception as e:
         print(f"Error in Display Process @ init Pygame: {e}")
         STOP_FLAG.set()
@@ -484,42 +486,70 @@ def display(
         return
 
     try:
+        def current_class_count():
+            return len(class_toggle_checkboxes)
+
+        def set_all_classes(value):
+            for i in range(current_class_count()):
+                TARGET_CLASSES[i] = int(value)
+
         def toggle_all_classes():
-            # Check if all are currently enabled
-            all_on = all(TARGET_CLASSES[i] == 1 for i in range(len(TARGET_CLASSES)))
-        
-            new_value = 0 if all_on else 1
-        
-            for i in range(len(TARGET_CLASSES)):
-                TARGET_CLASSES[i] = new_value
-                
+            n = current_class_count()
+            all_on = all(TARGET_CLASSES[i] == 1 for i in range(n))
+            set_all_classes(0 if all_on else 1)
+
         def toggle_target_classes(i):
             TARGET_CLASSES[i] = 1 - TARGET_CLASSES[i]
-        
-        class_selection_rect = SIDEBAR_RECT.copy()
-        class_names = list(MODEL_NAMES.values()) if isinstance(MODEL_NAMES, dict) else list(MODEL_NAMES)
-        class_toggle_checkboxes = []
-        class_color_swatches = []
+
+        # Sidebar layout: in RGB mode with hot-swap support, the sidebar is
+        # split into a model panel (top) and the class list (below).
+        HAS_MODEL_SWAP = (not NIR_MODE) and (MODEL_SWAP_QUEUE is not None)
+        if HAS_MODEL_SWAP:
+            model_panel_rect = pygame.Rect(SIDEBAR_RECT.x, SIDEBAR_RECT.y, SIDEBAR_RECT.w, 118)
+            class_selection_rect = pygame.Rect(
+                SIDEBAR_RECT.x, SIDEBAR_RECT.y + 130,
+                SIDEBAR_RECT.w, SIDEBAR_RECT.h - 130
+            )
+        else:
+            model_panel_rect = None
+            class_selection_rect = SIDEBAR_RECT.copy()
+
         row_height = 38
-        list_start_y = class_selection_rect.y + (76 if NIR_MODE else 52)
-        for i, name in enumerate(class_names):
-            checkbox_x = class_selection_rect.x + 18
-            text = name
-            if NIR_MODE:
-                checkbox_x = class_selection_rect.x + 54
-                class_color_swatches.append(ClassColorSwatch(
-                    rect=(class_selection_rect.x + 18, list_start_y + i * row_height, 24, 24),
-                    class_index=i,
-                    colors_proxy=NIR_CLASS_COLORS,
+        list_start_y = class_selection_rect.y + 76
+
+        def build_class_widgets(names_list):
+            checkboxes, swatches = [], []
+            for i, name in enumerate(names_list):
+                checkbox_x = class_selection_rect.x + 18
+                if NIR_MODE:
+                    checkbox_x = class_selection_rect.x + 54
+                    swatches.append(ClassColorSwatch(
+                        rect=(class_selection_rect.x + 18, list_start_y + i * row_height, 24, 24),
+                        class_index=i,
+                        colors_proxy=NIR_CLASS_COLORS,
+                    ))
+                checkboxes.append(CheckBox(
+                    rect=(checkbox_x, list_start_y + i * row_height, 24, 24),
+                    text=str(name),
+                    checked=(TARGET_CLASSES[i] == 1) if i < len(TARGET_CLASSES) else False,
+                    callback=lambda i=i: toggle_target_classes(i),
+                    font_size=18,
+                    color=COLOR_TEXT,
                 ))
-            class_toggle_checkboxes.append(CheckBox(
-                rect=(checkbox_x, list_start_y + i * row_height, 24, 24),
-                text=text,
-                checked=(TARGET_CLASSES[i] == 1),
-                callback=lambda i=i: toggle_target_classes(i),
-                font_size=18,
-                color=COLOR_TEXT,
-            ))
+            return checkboxes, swatches
+
+        class_names = list(MODEL_NAMES.values()) if isinstance(MODEL_NAMES, dict) else list(MODEL_NAMES)
+        class_toggle_checkboxes, class_color_swatches = build_class_widgets(class_names)
+
+        # UI-side view of the active detection model (RGB hot-swap modes).
+        ui_model = {
+            "generation": -1,
+            "kind": "",
+            "path": "",
+            "status": "",
+        }
+        last_model_poll = 0.0
+
         list_offset_y = 0
         scroll_velocity = 0.0
         is_dragging = False
@@ -537,6 +567,14 @@ def display(
         btn_raw = ToggleButton(650, 825-25, 170, 44, lambda: toggleRawRecording(RECORD_RAW), "Raw Recording", style="success")
         btn_record = ToggleButton(470, 825-25, 170, 44, toggleRecording, "Save GUI Frames", style="danger")
         buttons = [btn_calibrate, btn_boxes, btn_raw, btn_record]
+
+        if NIR_MODE:
+            # Tracking-based speed calibration and YOLO box drawing have no
+            # effect in NIR line-scan mode. Worse, enabling calibration would
+            # silently suppress ejection (createMask gates on it), so both are
+            # disabled instead of left as dead/dangerous controls.
+            btn_calibrate.enabled = False
+            btn_boxes.enabled = False
         
         
         
@@ -546,6 +584,42 @@ def display(
         buttons.append(btn_flip_h)
         btn_flip_v = ToggleButton(830, 825+54-25, 54, 44, lambda: toggleFLIP_V(FLIP_V), "FlipV", style="success")
         buttons.append(btn_flip_v)
+
+        # Buttons that live inside the sidebar panels; drawn after the panels
+        # so the panel background does not paint over them.
+        panel_buttons = []
+
+        btn_classes_all = Button(
+            class_selection_rect.right - 156, class_selection_rect.y + 12, 64, 30,
+            lambda: set_all_classes(1), "All", style="primary"
+        )
+        btn_classes_none = Button(
+            class_selection_rect.right - 84, class_selection_rect.y + 12, 64, 30,
+            lambda: set_all_classes(0), "None", style="primary"
+        )
+        panel_buttons.extend([btn_classes_all, btn_classes_none])
+
+        btn_load_model = None
+        if HAS_MODEL_SWAP:
+            def request_model_swap():
+                path = easygui.fileopenbox(
+                    msg="Select an Ultralytics YOLO or RT-DETR model (auto-detected)",
+                    title="Load detection model",
+                    default="*.pt",
+                    filetypes=["*.pt", "*.onnx", "*.engine"],
+                )
+                if path:
+                    try:
+                        MODEL_SWAP_QUEUE.put_nowait(path)
+                        ui_model["status"] = f"requested {os.path.basename(path)} ..."
+                    except Exception as exc:
+                        print(f"[UI] Could not request model swap: {exc}")
+
+            btn_load_model = Button(
+                model_panel_rect.right - 162, model_panel_rect.y + 14, 146, 40,
+                request_model_swap, "Load Model", style="primary"
+            )
+            panel_buttons.append(btn_load_model)
         
         if NIR_MODE:
             controls = [
@@ -676,6 +750,9 @@ def display(
         return
 
     frame = None
+    esc_armed_until = 0.0
+    show_help = False
+    last_frame_received = time.time()
     while not STOP_FLAG.is_set():
         try:
             events = pygame.event.get()
@@ -705,7 +782,14 @@ def display(
                     elif event.key == pygame.K_v: increaseVertMovement(VERT_MOVEMENT)
                     elif event.key == pygame.K_b: decreaseVertMovement(VERT_MOVEMENT)
                     elif event.key == pygame.K_SPACE: recording = not recording
-                    elif event.key == pygame.K_ESCAPE: STOP_FLAG.set(); break
+                    elif event.key in (pygame.K_F1, pygame.K_h): show_help = not show_help
+                    elif event.key == pygame.K_ESCAPE:
+                        # Double-press guard: a single accidental ESC must not
+                        # shut down the live sorting pipeline.
+                        now = time.time()
+                        if now < esc_armed_until:
+                            STOP_FLAG.set(); break
+                        esc_armed_until = now + 1.5
 
             try:
                 nozzle_mask, class_image = DISPLAY_QUEUE.get(timeout=0.01)
@@ -719,8 +803,29 @@ def display(
                 display_mask = cv2.resize(nozzle_mask, (256, 640), interpolation=cv2.INTER_NEAREST)
                 class_image = cv2.cvtColor(class_image, cv2.COLOR_BGR2RGB)
                 frame = getSurface(class_image, display_mask)
+                last_frame_received = time.time()
             except Empty:
                 pass
+
+            # Poll the producer's model info (hot-swap status / class names).
+            # Throttled: a manager-dict read is one IPC round trip.
+            if MODEL_INFO is not None and time.time() - last_model_poll > 0.5:
+                last_model_poll = time.time()
+                try:
+                    ui_model["kind"] = str(MODEL_INFO.get("kind", ""))
+                    ui_model["path"] = str(MODEL_INFO.get("path", ""))
+                    ui_model["status"] = str(MODEL_INFO.get("status", ""))
+                    gen = int(MODEL_INFO.get("generation", 0))
+                    if gen != ui_model["generation"]:
+                        ui_model["generation"] = gen
+                        names_map = dict(MODEL_INFO.get("names", {}))
+                        names_list = [str(names_map[k]) for k in sorted(names_map)]
+                        if names_list:
+                            class_toggle_checkboxes, class_color_swatches = build_class_widgets(names_list)
+                            list_offset_y = 0
+                            scroll_velocity = 0.0
+                except Exception as exc:
+                    print(f"[UI] Model info poll failed: {exc}")
 
             if frame is None:
                 clock.tick(GUI_DISPLAY_FPS); continue
@@ -732,11 +837,12 @@ def display(
             btn_flip_h.clicked = bool(FLIP_H.value)
             btn_flip_v.clicked = bool(FLIP_V.value)
             for button in buttons: button.update(events)
+            for button in panel_buttons: button.update(events)
             for control in controls: control.update(events)
 
             mouse_pos = pygame.mouse.get_pos()
             mouse_pressed = pygame.mouse.get_pressed()[0]
-            list_top = class_selection_rect.y + 48
+            list_top = class_selection_rect.y + 72
             list_bottom = class_selection_rect.bottom - 12
             content_height = len(class_toggle_checkboxes) * row_height
             visible_height = list_bottom - list_top
@@ -770,11 +876,12 @@ def display(
 
             screen.fill(COLOR_BG)            
             screen.blit(frame, FRAME_DEST)            
-            if NIR_MODE:
-                # No detection line in line-scan mode
-                DETECTION_POS = 0
-                COLOR_CHECK = pygame.Color("red")
-            pygame.draw.line(screen, COLOR_CHECK, (0, DETECTION_POS), (640, DETECTION_POS), 2)
+            if not NIR_MODE:
+                # Detection line: the y position where the mask is sampled for
+                # ejection. NIR line-scan mode has no meaningful y position, so
+                # no line is drawn there.
+                pygame.draw.line(screen, COLOR_CHECK, (0, DETECTION_POS), (640, DETECTION_POS), 2)
+                draw_text(screen, "detection line", font_small, COLOR_CHECK, (8, DETECTION_POS - 22))
 
             info_panel = pygame.Rect(10, 645, 900, SIDEBAR_RECT.bottom - 645)
             draw_rounded_panel(screen, info_panel, fill=COLOR_SURFACE, border=COLOR_PANEL_BORDER, radius=16)
@@ -813,11 +920,35 @@ def display(
                 card_x += card_width+card_spacing
             for button in buttons: button.draw(screen)
 
+            # --- Model panel (RGB hot-swap modes) ---
+            if HAS_MODEL_SWAP:
+                draw_rounded_panel(screen, model_panel_rect, fill=COLOR_SURFACE, border=COLOR_PANEL_BORDER, radius=16)
+                draw_text(screen, "Detection Model", font_title, COLOR_TEXT, (model_panel_rect.x + 16, model_panel_rect.y + 8))
+                model_kind = ui_model["kind"] or "?"
+                kind_color = (150, 96, 230) if model_kind == "RTDETR" else COLOR_PRIMARY
+                kind_rect = pygame.Rect(model_panel_rect.x + 16, model_panel_rect.y + 48, 76, 24)
+                pygame.draw.rect(screen, kind_color, kind_rect, border_radius=12)
+                draw_text(screen, model_kind, font_small_bold, COLOR_TEXT, kind_rect.center, align="center")
+                model_base = os.path.basename(ui_model["path"]) or "-"
+                if len(model_base) > 36:
+                    model_base = model_base[:33] + "..."
+                draw_text(screen, model_base, font_small, COLOR_ACCENT, (kind_rect.right + 10, model_panel_rect.y + 51))
+                status_text = ui_model["status"] or ""
+                status_color = COLOR_DANGER if "failed" in status_text.lower() else COLOR_TEXT_MUTED
+                if len(status_text) > 52:
+                    status_text = status_text[:49] + "..."
+                draw_text(screen, status_text, font_small, status_color, (model_panel_rect.x + 16, model_panel_rect.y + 84))
+
+            # --- Class selection panel ---
             draw_rounded_panel(screen, class_selection_rect, fill=COLOR_SURFACE, border=COLOR_PANEL_BORDER, radius=16)
             draw_text(screen, "NIR Eject Class Selection" if NIR_MODE else "Target Class Selection", font_title, COLOR_TEXT, (class_selection_rect.x + 16, class_selection_rect.y + 12))
+            n_cls = len(class_toggle_checkboxes)
+            n_on = sum(1 for i in range(min(n_cls, len(TARGET_CLASSES))) if TARGET_CLASSES[i] == 1)
             if NIR_MODE:
-                draw_text(screen, "color square: left-click cycle, right-click hex", font_small, COLOR_TEXT_MUTED, (class_selection_rect.x + 16, class_selection_rect.y + 40))
-            clip_rect = pygame.Rect(class_selection_rect.x + 8, class_selection_rect.y + 46, class_selection_rect.w - 16, class_selection_rect.h - 56)
+                draw_text(screen, f"{n_on}/{n_cls} enabled  •  color square: left-click cycle, right-click hex", font_small, COLOR_TEXT_MUTED, (class_selection_rect.x + 16, class_selection_rect.y + 48))
+            else:
+                draw_text(screen, f"{n_on}/{n_cls} enabled  •  [0] toggles all", font_small, COLOR_TEXT_MUTED, (class_selection_rect.x + 16, class_selection_rect.y + 48))
+            clip_rect = pygame.Rect(class_selection_rect.x + 8, class_selection_rect.y + 68, class_selection_rect.w - 16, class_selection_rect.h - 78)
             old_clip = screen.get_clip(); screen.set_clip(clip_rect)
             if NIR_MODE:
                 for swatch in class_color_swatches:
@@ -834,8 +965,63 @@ def display(
                 scroll_ratio = 0 if max_negative_offset == 0 else (list_offset_y / max_negative_offset)
                 thumb_y = track_rect.y + int((track_rect.h - thumb_h) * scroll_ratio)
                 pygame.draw.rect(screen, COLOR_ACCENT, pygame.Rect(track_rect.x, thumb_y, track_rect.w, thumb_h), border_radius=2)
-            #draw_text(screen, "ESC quit • SPACE record GUI • V/B adjust vertical movement", font_small, COLOR_TEXT_MUTED, (class_selection_rect.x + 16, class_selection_rect.bottom + 24))
-            draw_text(screen, "• ESC quit •", font_small, COLOR_TEXT_MUTED, (16, 16))
+
+            for button in panel_buttons: button.draw(screen)
+
+            # --- Status bar over the live view ---
+            def draw_status_pill(x, text, color, blink=False):
+                label = font_small_bold.render(text, True, COLOR_TEXT)
+                pad_left = 26 if blink else 10
+                rect = pygame.Rect(x, 10, label.get_width() + pad_left + 10, 26)
+                pill = pygame.Surface(rect.size, pygame.SRCALPHA)
+                pygame.draw.rect(pill, (*color, 225), pill.get_rect(), border_radius=13)
+                screen.blit(pill, rect.topleft)
+                if blink and int(time.time() * 2) % 2 == 0:
+                    pygame.draw.circle(screen, COLOR_TEXT, (rect.x + 14, rect.centery), 4)
+                screen.blit(label, (rect.x + pad_left, rect.y + 4))
+                return rect.right + 8
+
+            pill_x = 10
+            if time.time() < esc_armed_until:
+                pill_x = draw_status_pill(pill_x, "PRESS ESC AGAIN TO QUIT", COLOR_DANGER)
+            if recording:
+                pill_x = draw_status_pill(pill_x, "REC GUI", COLOR_DANGER, blink=True)
+            if RECORD_RAW.value:
+                pill_x = draw_status_pill(pill_x, "REC RAW", COLOR_DANGER, blink=True)
+            if NIR_MODE:
+                pill_x = draw_status_pill(pill_x, "NIR LINE-SCAN", COLOR_PRIMARY)
+            frame_age = time.time() - last_frame_received
+            if frame_age > 2.0:
+                pill_x = draw_status_pill(pill_x, f"NO NEW FRAMES {frame_age:.0f}s", COLOR_DANGER, blink=True)
+            draw_text(screen, f"UI {clock.get_fps():.0f} fps  •  F1/H help  •  ESC x2 quit", font_small, COLOR_TEXT_MUTED, (12, 42))
+
+            # --- Help overlay ---
+            if show_help:
+                overlay = pygame.Surface((640, 640), pygame.SRCALPHA)
+                overlay.fill((10, 12, 16, 220))
+                screen.blit(overlay, (0, 0))
+                draw_text(screen, "Keyboard Shortcuts", font_title, COLOR_TEXT, (24, 18))
+                help_lines = [
+                    ("ESC  ESC", "quit (press twice within 1.5 s)"),
+                    ("F1 / H", "toggle this help"),
+                    ("SPACE", "toggle GUI frame recording"),
+                    ("0", "toggle all classes"),
+                    ("1 / 2", "toggle class 1 / class 2"),
+                    ("UP/DOWN", "delay +/- 0.01 s"),
+                    ("LEFT/RIGHT", "delay +/- 0.001 s"),
+                    ("Num + / -", "prediction confidence"),
+                    ("PgUp / PgDn", "prediction IoU"),
+                    ("Q / A", "Vorschuss + / -"),
+                    ("W / S", "Nachschuss + / -"),
+                    ("X / Y", "Beischuss + / -"),
+                    ("P / O", "NIR background threshold + / -" if NIR_MODE else "threshold + / -"),
+                    ("V / B", "vertical movement + / -"),
+                ]
+                hy = 66
+                for keys_txt, desc in help_lines:
+                    draw_text(screen, keys_txt, font_small_bold, COLOR_ACCENT, (24, hy))
+                    draw_text(screen, desc, font_small, COLOR_TEXT, (190, hy))
+                    hy += 30
 
             if SCALEABLE:
                 scaled = pygame.transform.smoothscale(screen, SCREEN.get_size())

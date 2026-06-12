@@ -27,6 +27,8 @@ import datetime
 
 from UI_LAYER import display
 
+from MODEL_HOTSWAP import load_detection_model, names_to_dict
+
 from NOZZLE_CONTROL_LAYER import (
     nozzle_control_UDP,
     nozzle_control_ARDUINO,
@@ -272,6 +274,25 @@ def prepare_nir_frame_for_pipeline(img, output_size=640):
 # Mask generation and vertical movement calibration
 # ---------------------------------------------------------------------------
 
+# Upper bound for hot-swappable models. TARGET_CLASSES is a fixed-size shared
+# array, so it is allocated once at this size and only the first
+# N_CLASSES.value entries are meaningful for the currently loaded model.
+MAX_MODEL_CLASSES = 256
+
+
+def publish_model_info(MODEL_INFO, names, kind, path, status):
+    """Publish the active detection model to the UI process (manager dict)."""
+    if MODEL_INFO is None:
+        return
+    try:
+        MODEL_INFO["names"] = {int(k): str(v) for k, v in dict(names).items()}
+        MODEL_INFO["kind"] = str(kind)
+        MODEL_INFO["path"] = str(path)
+        MODEL_INFO["status"] = str(status)
+        MODEL_INFO["generation"] = int(MODEL_INFO.get("generation", 0)) + 1
+    except Exception as e:
+        print(f"[Process-1] Could not publish model info: {e}")
+
 
 
 def is_nir_camera_type(camera_type):
@@ -349,6 +370,12 @@ def _append_nir_raw_line(state, camera, output_dir, chunk_lines=NIR_RAW_CHUNK_LI
     if sample is None:
         return
 
+    ts = float(getattr(camera, "last_line_timestamp", 0.0) or time.monotonic())
+    # A failed read() leaves the previous line on the camera object; do not
+    # record the same physical line twice.
+    if state["timestamps"] and state["timestamps"][-1] == ts:
+        return
+
     mode = _nir_raw_mode(camera)
     if state.get("mode") != mode:
         _flush_nir_raw_chunk(state, output_dir, reason="modechange")
@@ -358,7 +385,7 @@ def _append_nir_raw_line(state, camera, output_dir, chunk_lines=NIR_RAW_CHUNK_LI
         state["wall_start"] = datetime.datetime.now()
 
     state["buffer"].append(sample)
-    state["timestamps"].append(float(getattr(camera, "last_line_timestamp", 0.0) or time.monotonic()))
+    state["timestamps"].append(ts)
 
     if len(state["buffer"]) >= int(chunk_lines):
         _flush_nir_raw_chunk(state, output_dir, reason="full")
@@ -596,6 +623,9 @@ def produce(
     NIR_CLASSIFIER_KIND="SAM_PLACEHOLDER",
     NIR_CLASS_COLORS=None,
     NIR_RAW_CHUNK_LINES_VALUE=NIR_RAW_CHUNK_LINES,
+    MODEL_INFO=None,
+    MODEL_SWAP_QUEUE=None,
+    N_CLASSES=None,
 ):
     backup_image = cv2.imread("preheat_image.png")
     is_nir_camera = is_nir_camera_type(CAMERA_TYPE)
@@ -604,6 +634,7 @@ def produce(
     save_name = "aufnahme"
     nir_raw_state = {"buffer": [], "timestamps": [], "mode": None, "chunk_index": 0, "wall_start": None}
     nir_recording_was_active = False
+    last_nir_mask_timestamp = None
 
     # Cammera Reconnection
     camera_connected = False
@@ -648,24 +679,89 @@ def produce(
         camera = None
 
     model = None
+    model_kind = "YOLO"
     all_classes = []
     if is_nir_camera:
         print("[Process-1] NIR camera selected: skipping YOLO model load/preheat.")
     else:
         try:
-            model = YOLO(MODEL_PATH, task="detect")
-            all_classes = list(range(len(model.names)))
+            model, model_kind, model_names = load_detection_model(MODEL_PATH)
+            all_classes = list(range(len(model_names)))
         except Exception as e:
             print(f"Error in Loading Model: {e}")
             print("Downloading yolov8n base model")
             model = YOLO("yolov8n.pt", task="detect")
-            all_classes = list(range(len(model.names)))
+            model_kind = "YOLO"
+            model_names = names_to_dict(model.names)
+            all_classes = list(range(len(model_names)))
+
+        if N_CLASSES is not None:
+            N_CLASSES.value = len(all_classes)
+        publish_model_info(MODEL_INFO, model_names, model_kind, MODEL_PATH, "ready")
 
         try:
             _ = model("preheat_image.png", conf=CONF.value, iou=IOU.value, verbose=MODEL_VERBOSE)
             print("Preheat Complete")
         except Exception as e:
             print(f"[Process-1] Error in Model Preheating: {e}")
+
+    def try_model_hotswap():
+        """RGB-mode only: swap the detection model when the UI requests it."""
+        nonlocal model, model_kind, all_classes
+        if MODEL_SWAP_QUEUE is None:
+            return
+        try:
+            new_path = MODEL_SWAP_QUEUE.get_nowait()
+        except Empty:
+            return
+        if not new_path:
+            return
+
+        base = os.path.basename(str(new_path))
+        print(f"[Process-1] Model hotswap requested: {new_path}")
+        if MODEL_INFO is not None:
+            try:
+                MODEL_INFO["status"] = f"loading {base} ..."
+            except Exception:
+                pass
+
+        try:
+            new_model, new_kind, new_names = load_detection_model(new_path)
+            # Preheat before swapping so the live pipeline never sees the
+            # first-inference latency spike.
+            try:
+                _ = new_model("preheat_image.png", conf=CONF.value, iou=IOU.value, verbose=MODEL_VERBOSE)
+            except Exception as preheat_exc:
+                print(f"[Process-1] Hotswap preheat warning: {preheat_exc}")
+
+            if len(new_names) > MAX_MODEL_CLASSES:
+                raise ValueError(
+                    f"Model has {len(new_names)} classes; maximum supported is {MAX_MODEL_CLASSES}."
+                )
+
+            model = new_model
+            model_kind = new_kind
+            all_classes = list(range(len(new_names)))
+
+            # Class indices are model-specific: reset the shared selection.
+            for i in range(len(TARGET_CLASSES)):
+                TARGET_CLASSES[i] = 0
+            if N_CLASSES is not None:
+                N_CLASSES.value = len(all_classes)
+
+            # Reset producer-local detection state.
+            last_mask.fill(0)
+            previous_track_centers.clear()
+
+            publish_model_info(MODEL_INFO, new_names, new_kind, new_path, "ready")
+            print(f"[Process-1] Model hotswap complete: {new_kind} / {base}")
+        except Exception as exc:
+            print(f"[Process-1] Model hotswap failed, keeping previous model: {exc}")
+            if MODEL_INFO is not None:
+                try:
+                    MODEL_INFO["status"] = f"load failed: {exc}"
+                except Exception:
+                    pass
 
     def reconnect_camera():
         nonlocal camera, camera_connected, last_reconnect_attempt
@@ -716,6 +812,9 @@ def produce(
             print(f"[Process-1] Camera reconnect error: {e}")
 
     while not STOP_FLAG.is_set():
+        if not is_nir_camera:
+            try_model_hotswap()
+
         try:
             if camera_connected and CAMERA_TYPE.lower() == "basler":
                 if camera.IsGrabbing():
@@ -790,6 +889,11 @@ def produce(
             latest_line = getattr(camera, "last_classified_line", np.zeros((1,), dtype=np.uint8))
             line_timestamp = float(getattr(camera, "last_line_timestamp", 0.0) or time.monotonic())
 
+            # A failed read() leaves the previous line in place; the same
+            # physical line must not be ejected twice.
+            is_new_line = line_timestamp != last_nir_mask_timestamp
+            last_nir_mask_timestamp = line_timestamp
+
             # Executable NIR ejection is one timestamped line.  Do not create a
             # 640-high mask and do not later crop it at DETECTION_POS.
             nozzle_line_mask = classified_line_to_nozzle_mask(
@@ -812,7 +916,8 @@ def produce(
                 img = colorize_nir_class_buffer(rolling_classes, NIR_CLASS_COLORS)
 
             try:
-                MASK_QUEUE.put_nowait((nozzle_line_mask, line_timestamp))
+                if is_new_line:
+                    MASK_QUEUE.put_nowait((nozzle_line_mask, line_timestamp))
             except Full:
                 pass
 
@@ -1091,6 +1196,7 @@ if __name__ == "__main__":
 
     multiprocessing.set_start_method("spawn", force=True)
 
+    MODEL_KIND = "NIR"
     if is_nir_camera_type(CAMERA_TYPE):
         nir_settings = load_nir_camera_settings(MVIMPACT_NIR_SETTINGS_PATH)
         n_nir_classes = int(nir_settings.get("synthetic_classes", nir_settings.get("classes", 4)))
@@ -1109,20 +1215,15 @@ if __name__ == "__main__":
         print(f"[Main] NIR raw recording chunk size: {NIR_RAW_CHUNK_LINES_VALUE} lines")
     else:
         try:
-            model_temp = YOLO(MODEL_PATH, task="detect")
-            if isinstance(model_temp.names, dict):
-                MODEL_NAMES = dict(model_temp.names)
-            else:
-                MODEL_NAMES = {i: name for i, name in enumerate(model_temp.names)}
+            model_temp, MODEL_KIND, MODEL_NAMES = load_detection_model(MODEL_PATH)
             ALL_CLASSES = list(range(len(MODEL_NAMES)))
         except Exception as e:
             print(f"Error in Loading Model for UI. Error: {e}")
             model_temp = YOLO("yolov8n.pt", task="detect")
-            if isinstance(model_temp.names, dict):
-                MODEL_NAMES = dict(model_temp.names)
-            else:
-                MODEL_NAMES = {i: name for i, name in enumerate(model_temp.names)}
+            MODEL_KIND = "YOLO"
+            MODEL_NAMES = names_to_dict(model_temp.names)
             ALL_CLASSES = list(range(len(MODEL_NAMES)))
+        del model_temp  # Only the names/kind are needed in the main process.
 
     runtime_cfg = load_runtime_config()
     manager = multiprocessing.Manager()
@@ -1135,7 +1236,23 @@ if __name__ == "__main__":
     if len(targets) != len(MODEL_NAMES):
         targets = np.zeros(len(MODEL_NAMES)).astype(int).tolist()
     
-    TARGET_CLASSES = multiprocessing.Array("i", targets)
+    # The shared array is allocated at the hot-swap maximum so a newly loaded
+    # model with a different class count can reuse it. Only the first
+    # N_CLASSES.value entries are meaningful at any time.
+    padded_targets = (list(targets) + [0] * MAX_MODEL_CLASSES)[:MAX_MODEL_CLASSES]
+    TARGET_CLASSES = multiprocessing.Array("i", padded_targets)
+    N_CLASSES = multiprocessing.Value("i", len(MODEL_NAMES))
+
+    # Model hot-swap channel (RGB camera modes only):
+    #   UI  -> MODEL_SWAP_QUEUE: requested model file path
+    #   producer -> MODEL_INFO:  names/kind/path/status + generation counter
+    MODEL_SWAP_QUEUE = multiprocessing.Queue(maxsize=4)
+    MODEL_INFO = manager.dict()
+    MODEL_INFO["names"] = {int(k): str(v) for k, v in MODEL_NAMES.items()}
+    MODEL_INFO["kind"] = MODEL_KIND
+    MODEL_INFO["path"] = MODEL_PATH
+    MODEL_INFO["status"] = "starting..."
+    MODEL_INFO["generation"] = 0
 
     nir_settings_for_colors = load_nir_camera_settings(MVIMPACT_NIR_SETTINGS_PATH) if is_nir_camera_type(CAMERA_TYPE) else {}
     default_color_cfg = nir_settings_for_colors.get("class_colors", [])
@@ -1259,6 +1376,9 @@ if __name__ == "__main__":
             NIR_CLASSIFIER_KIND,
             NIR_CLASS_COLORS,
             NIR_RAW_CHUNK_LINES_VALUE,
+            MODEL_INFO,
+            MODEL_SWAP_QUEUE,
+            N_CLASSES,
         ),
     )
 
@@ -1294,6 +1414,9 @@ if __name__ == "__main__":
             is_nir_camera_type(CAMERA_TYPE),
             NIR_CLASSIFIER_KIND,
             NIR_CLASS_COLORS,
+            MODEL_INFO,
+            MODEL_SWAP_QUEUE,
+            N_CLASSES,
         ),
     )
 
@@ -1323,7 +1446,7 @@ if __name__ == "__main__":
             print(f"Process: \"{p_names[i]}\" terminated gracefully")
 
     runtime_cfg_out = {
-    "TARGET_CLASSES": list(TARGET_CLASSES),
+    "TARGET_CLASSES": list(TARGET_CLASSES)[:max(1, int(N_CLASSES.value))],
 
     "CONF": CONF.value,
     "IOU": IOU.value,
