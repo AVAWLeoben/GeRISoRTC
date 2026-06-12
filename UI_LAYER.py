@@ -17,6 +17,7 @@ import numpy as np
 import pygame
 import easygui
 
+import threading
 import traceback
 
 COLOR_BG = (18, 20, 25)
@@ -146,6 +147,8 @@ class ClassColorSwatch:
         self.hovered = False
         self.enabled = True
         self.small_font = pygame.font.SysFont("Segoe UI", 13)
+        self.color_picker_active = False
+        self.pending_color = None
 
     def _get_color(self):
         try:
@@ -181,38 +184,44 @@ class ClassColorSwatch:
             self._set_color(normalise_rgb(text, self._get_color()))
 
     def _prompt_color(self):
-        try:
-            from tkinter import Tk
-            from tkinter.colorchooser import askcolor
+        if self.color_picker_active:
+            return
     
-            root = Tk()
-            root.withdraw()
-            root.attributes("-topmost", True)
+        self.color_picker_active = True
+        current = rgb_to_hex(self._get_color())
     
-            rgb, hex_color = askcolor(
-                color=rgb_to_hex(self._get_color()),
-                title=f"Choose color for class {self.class_index}",
-                parent=root,
-            )
+        def worker():
+            try:
+                from tkinter import Tk
+                from tkinter.colorchooser import askcolor
     
-            root.destroy()
+                root = Tk()
+                root.withdraw()
+                root.attributes("-topmost", True)
     
-            if hex_color:
-                self._set_color(normalise_rgb(hex_color, self._get_color()))
+                _, hex_color = askcolor(
+                    color=current,
+                    title=f"Choose color for class {self.class_index}",
+                    parent=root,
+                )
     
-        except Exception as exc:
-            print(f"[UI] Tk color picker failed: {exc}")
+                root.destroy()
     
-            # fallback to old hex prompt
-            text = easygui.enterbox(
-                "Enter RGB hex color for this NIR class, e.g. #FF4040",
-                "NIR class color",
-                rgb_to_hex(self._get_color()),
-            )
-            if text:
-                self._set_color(normalise_rgb(text, self._get_color()))
+                if hex_color:
+                    self.pending_color = hex_color
+    
+            except Exception as exc:
+                print(f"[UI] Tk color picker failed: {exc}")
+    
+            finally:
+                self.color_picker_active = False
+    
+        threading.Thread(target=worker, daemon=True).start()
 
     def update(self, events):
+        if self.pending_color:
+            self._set_color(normalise_rgb(self.pending_color, self._get_color()))
+            self.pending_color = None
         mouse_pos = pygame.mouse.get_pos()
         self.hovered = self.rect.collidepoint(mouse_pos)
         if not self.enabled:
