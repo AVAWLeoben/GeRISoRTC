@@ -170,7 +170,7 @@ class ClassColorSwatch:
         except ValueError:
             self._set_color(choices[self.class_index % len(choices)])
 
-    def _prompt_color(self):
+    def _prompt_color_hex(self):
         current = rgb_to_hex(self._get_color())
         text = easygui.enterbox(
             "Enter RGB hex color for this NIR class, e.g. #FF4040",
@@ -179,6 +179,38 @@ class ClassColorSwatch:
         )
         if text:
             self._set_color(normalise_rgb(text, self._get_color()))
+
+    def _prompt_color(self):
+        try:
+            from tkinter import Tk
+            from tkinter.colorchooser import askcolor
+    
+            root = Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+    
+            rgb, hex_color = askcolor(
+                color=rgb_to_hex(self._get_color()),
+                title=f"Choose color for class {self.class_index}",
+                parent=root,
+            )
+    
+            root.destroy()
+    
+            if hex_color:
+                self._set_color(normalise_rgb(hex_color, self._get_color()))
+    
+        except Exception as exc:
+            print(f"[UI] Tk color picker failed: {exc}")
+    
+            # fallback to old hex prompt
+            text = easygui.enterbox(
+                "Enter RGB hex color for this NIR class, e.g. #FF4040",
+                "NIR class color",
+                rgb_to_hex(self._get_color()),
+            )
+            if text:
+                self._set_color(normalise_rgb(text, self._get_color()))
 
     def update(self, events):
         mouse_pos = pygame.mouse.get_pos()

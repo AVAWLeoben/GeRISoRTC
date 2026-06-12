@@ -342,6 +342,16 @@ def _flush_nir_raw_chunk(state, output_dir, reason="chunk"):
 
     os.makedirs(output_dir, exist_ok=True)
     data = np.stack(state["buffer"], axis=0)
+    
+    
+    # Convert from:
+    # (lines, width, bands)
+    # to:
+    # (width, bands, lines)
+    
+    if data.ndim == 3:
+        data = np.transpose(data, (1, 2, 0))
+    
     timestamps = np.asarray(state["timestamps"], dtype=np.float64)
 
     first_ts = state["wall_start"] or datetime.datetime.now()
@@ -1148,6 +1158,26 @@ def consume(MASK_QUEUE, STOP_FLAG, DELAY, NOZZLE_CONTROL_FUNCTION, DETECTION_POS
     control_nozzle_thread.join()
 
 
+def load_sklearn_bundle_metadata(path):
+    if not path or not os.path.exists(path):
+        return {}
+
+    try:
+        import joblib
+        loaded = joblib.load(path)
+
+        if isinstance(loaded, dict):
+            return {
+                "class_names": loaded.get("class_names", []),
+                "class_labels": loaded.get("class_labels", []),
+                "kind": loaded.get("kind", "SKLEARN_PIPELINE"),
+            }
+
+    except Exception as exc:
+        print(f"[NIR] Could not load sklearn bundle metadata from {path}: {exc}")
+
+    return {}
+
 # ---------------------------------------------------------------------------
 # Main startup
 # ---------------------------------------------------------------------------
@@ -1199,19 +1229,38 @@ if __name__ == "__main__":
     MODEL_KIND = "NIR"
     if is_nir_camera_type(CAMERA_TYPE):
         nir_settings = load_nir_camera_settings(MVIMPACT_NIR_SETTINGS_PATH)
-        n_nir_classes = int(nir_settings.get("synthetic_classes", nir_settings.get("classes", 4)))
-        n_nir_classes = max(1, n_nir_classes)
-        configured_names = nir_settings.get("class_names", [])
+        bundle_meta = load_sklearn_bundle_metadata(NIR_CLASSIFIER_PATH)
+    
+        configured_names = bundle_meta.get("class_names") or nir_settings.get("class_names", [])
+    
         if isinstance(configured_names, list) and configured_names:
-            MODEL_NAMES = {i: str(configured_names[i]) if i < len(configured_names) else f"NIR Class {i}" for i in range(n_nir_classes)}
+            MODEL_NAMES = {
+                i: str(name)
+                for i, name in enumerate(configured_names)
+            }
         else:
+            n_nir_classes = int(
+                nir_settings.get(
+                    "synthetic_classes",
+                    nir_settings.get("classes", 4)
+                )
+            )
+            n_nir_classes = max(1, n_nir_classes)
+    
             MODEL_NAMES = {0: "Background"}
-            MODEL_NAMES.update({i: f"NIR Class {i}" for i in range(1, n_nir_classes)})
+            MODEL_NAMES.update({
+                i: f"NIR Class {i}"
+                for i in range(1, n_nir_classes)
+            })
+    
+        MODEL_KIND = bundle_meta.get("kind", NIR_CLASSIFIER_KIND or "NIR")
         ALL_CLASSES = list(range(len(MODEL_NAMES)))
+    
         print("[Main] NIR camera selected: skipping YOLO model load for UI.")
         print(f"[Main] NIR classifier kind: {NIR_CLASSIFIER_KIND}")
         if NIR_CLASSIFIER_PATH:
             print(f"[Main] NIR classifier path: {NIR_CLASSIFIER_PATH}")
+        print(f"[Main] NIR classes: {MODEL_NAMES}")
         print(f"[Main] NIR raw recording chunk size: {NIR_RAW_CHUNK_LINES_VALUE} lines")
     else:
         try:

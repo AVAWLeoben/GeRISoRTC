@@ -432,6 +432,9 @@ class MvImpactNIRCamera:
             try:
                 import joblib
                 loaded = joblib.load(self.classifier_path)
+                if isinstance(loaded, dict):
+                    self.class_names = loaded.get("class_names", [])
+                    loaded = loaded["pipeline"]
                 if not hasattr(loaded, "predict"):
                     raise TypeError("loaded object has no predict(...) method")
                 self._classifier = loaded
@@ -678,7 +681,8 @@ class MvImpactNIRCamera:
         self._load_synthetic_material_templates()
 
         # Low-intensity belt/background. Keep it below the background threshold.
-        bg_level = max(0.0, min(self.background_threshold * 0.55, self.background_threshold - 10.0))
+        #bg_level = max(0.0, min(self.background_threshold * 0.15, self.background_threshold - 1000.0))
+        bg_level = 300
         sample = self._rng.normal(
             loc=bg_level,
             scale=max(1.0, self.synthetic_noise),
@@ -775,10 +779,23 @@ class MvImpactNIRCamera:
         return arr % max(1, self.synthetic_classes)
 
     def _classify_spectral_sample(self, spectral: np.ndarray) -> np.ndarray:
+        spectral = np.asarray(spectral, dtype=np.float32)
+
+        # 1) Background pre-filter in raw ALU space
+        mean_alu = spectral.mean(axis=1)
+        foreground = mean_alu >= float(self.background_threshold)
+    
+        labels = np.zeros((spectral.shape[0],), dtype=np.uint8)
+    
+        # Nothing bright enough -> all background
+        if not np.any(foreground):
+            return labels
+        
+        # 2) Only send foreground spectra through sklearn pipeline
         if self._classifier is None:
             self._prepare_classifier()
         try:
-            labels = self._classifier.predict(spectral)
+            labels[foreground] = self._classifier.predict(spectral[foreground])
             labels = np.asarray(labels).reshape(-1)
             if labels.size != self.width:
                 labels = cv2.resize(labels[None, :].astype(np.uint8), (self.width, 1), interpolation=cv2.INTER_NEAREST)[0]
